@@ -1,44 +1,44 @@
-import sha1 from 'sha1';
-import { ObjectId } from 'mongodb';
-import dbClient from '../utils/db';
-import redisClient from '../utils/redis';
-import { userQueue } from '../worker';
+import Queue from 'bull'; // Job queue library for asynchronous tasks (sending welcome emails)
+import UsersCollection from '../utils/users'; // Utility for interacting with the user collection
+
+// Dedicated queue for sending welcome emails to new users
+const userQueue = Queue('send welcome email', { /* queue configuration options */ });
 
 class UsersController {
+  /**
+   * Controller for creating new users (POST /users).
+   * Handles user registration by creating a new user document in the database
+   * and adding a job to the queue for sending a welcome email.
+   *
+   * @param {import("express").Request} req - The incoming Express request object.
+   * @param {import("express").Response} res - The Express response object to send the response.
+   */
   static async postNew(req, res) {
-    const { email, password } = req.body;
+    const { email, password } = req.body; // Extract email and password from request body
 
-    if (!email) {
-      return res.status(400).json({ error: 'Missing email' });
-    }
-    if (!password) {
-      return res.status(400).json({ error: 'Missing password' });
-    }
-
-    const userExists = await dbClient.dbClient.collection('users').findOne({ email });
-    if (userExists) {
-      return res.status(400).json({ error: 'Already exist' });
+    // Validate required fields: email and password
+    if (email === undefined) {
+      res.status(400).json({ error: 'Missing email' });
+      return;
+    } else if (password === undefined) {
+      res.status(400).json({ error: 'Missing password' });
+      return;
     }
 
-    const hashedPassword = sha1(password);
+    // Check for existing user with the same email address
+    if (await UsersCollection.getUser({ email })) {
+      res.status(400).json({ error: 'Already exists' });
+      return;
+    }
 
-    const result = await dbClient.dbClient.collection('users').insertOne({ email, password: hashedPassword });
-    userQueue.add({ userId: result.insertedId });
-    return res.status(201).json({ id: result.insertedId, email });
-  }
+    // Create a new user document in the database
+    const userId = await UsersCollection.createUser(email, password);
 
-  static async getMe(req, res) {
-    const token = req.header('X-Token');
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-    const userId = await redisClient.get(`auth_${token}`);
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    // Add a job to the queue for sending a welcome email to the newly created user
+    userQueue.add({ userId }); // Asynchronously add the job to the queue
 
-    const users = await dbClient.dbClient.collection('users');
-    const ObjId = new ObjectId(userId);
-
-    const user = await users.findOne({ _id: ObjId });
-    if (user) return res.status(200).json({ id: userId, email: user.email });
-    return res.status(401).json({ error: 'Unauthorized' });
+    // Send a successful response with the user ID and email
+    res.status(201).json({ id: userId, email });
   }
 }
 

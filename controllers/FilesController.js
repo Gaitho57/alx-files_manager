@@ -1,171 +1,98 @@
-import { v4 as uuidv4 } from 'uuid';
-import fs from 'fs';
-import path from 'path';
-import { ObjectId } from 'mongodb';
-import mime from 'mime-types';
+import fs from 'fs'; // File system module for file operations
+import mime from 'mime-types'; // Module for determining file mime types
+import Queue from 'bull'; // Job queue library for asynchronous tasks (thumbnail generation)
+import { ObjectId } from 'mongodb'; // MongoDB object ID type
+
+// Import utilities for interacting with database and other components
 import dbClient from '../utils/db';
-import redisClient from '../utils/redis';
-import { fileQueue } from '../worker';
+import FilesCollection from '../utils/files';
+import AuthTokenHandler from '../utils/tokens';
+import UsersCollection from '../utils/users';
+import formatFileDocument from '../utils/format';
+
+// Dedicated queue for thumbnail generation tasks
+const fileQueue = Queue('thumbnail generation', { /* queue configuration options */ });
 
 class FilesController {
+  /**
+   * Controller for handling file uploads (POST /files).
+   * Creates a new file document in the database and stores the file data locally.
+   *
+   * @param {import("express").Request} req - The incoming Express request object.
+   * @param {import("express").Response} res - The Express response object to send the response.
+   */
   static async postUpload(req, res) {
-    const token = req.header('X-Token');
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = req.user._id; // Get user ID from the authenticated user
 
-    const userId = await redisClient.get(`auth_${token}`);
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-    const {
-      name, type, isPublic, data,
-    } = req.body;
-
-    if (!name) return res.status(400).json({ error: 'Missing name' });
-    if (!type || !['folder', 'file', 'image'].includes(type)) return res.status(400).json({ error: 'Missing type' });
-    if (!data && type !== 'folder') return res.status(400).json({ error: 'Missing data' });
-
-    let parentId = req.body.parentId || '0';
-    if (parentId !== '0') {
-      const parentFile = await dbClient.dbClient.collection('files').findOne({ _id: ObjectId(parentId) });
-      if (!parentFile) return res.status(400).json({ error: 'Parent not found' });
-      if (parentFile.type !== 'folder') return res.status(400).json({ error: 'Parent is not a folder' });
-    }
-    parentId = parentId !== '0' ? ObjectId(parentId) : '0';
-
-    const folderData = {
-      userId: ObjectId(userId),
-      name,
-      type,
-      isPublic: isPublic || false,
-      parentId,
-    };
-    if (type === 'folder') {
-      const newFolder = await dbClient.dbClient.collection('files').insertOne({
-        userId, name, type, isPublic: isPublic || false, parentId,
-      });
-      folderData.parentId = parentId === '0' ? 0 : ObjectId(parentId);
-      return res.status(201).json({ id: newFolder.insertedId, ...folderData });
+    // Create a new file document with user ID and other relevant information from the request body
+    let fileDocument;
+    try {
+      fileDocument = await FilesCollection.createFile({ ...req.body, userId });
+    } catch (err) {
+      // Handle errors during file creation
+      res.status(400).json({ error: err.message });
+      return;
     }
 
-    const folderName = process.env.FOLDER_PATH || '/tmp/files_manager';
-    const fileId = uuidv4();
-    const localPath = path.join(folderName, fileId);
+    // Handle non-folder file types:
+    if (fileDocument.type !== 'folder') {
+      // Store file data in the local storage path specified in the file document
+      FilesCollection.storeFileData(fileDocument.localPath, req.body.data);
 
-    await fs.promises.mkdir(folderName, { recursive: true });
-    await fs.promises.writeFile(path.join(folderName, fileId), Buffer.from(data, 'base64'));
-
-    const newFile = await dbClient.dbClient.collection('files').insertOne({ localPath, ...folderData });
-
-    if (type === 'image') {
-      fileQueue.add({ fileId: newFile.insertedId, userId });
+      // Add a job to the queue for generating a thumbnail for the uploaded file
+      const jobData = { fileId: fileDocument._id, userId };
+      fileQueue.add(jobData); // Add the job to the queue asynchronously
     }
 
-    folderData.parentId = parentId === '0' ? 0 : ObjectId(parentId);
-    return res.status(201).json({ id: newFile.insertedId, localPath, ...folderData });
+    // Send a successful response with the formatted file document information
+    res.status(201).json(formatFileDocument(fileDocument));
   }
 
+  /**
+   * Controller for retrieving file information by ID (GET /files/:id).
+   *
+   * @param {import("express").Request} req - The incoming Express request object.
+   * @param {import("express").Response} res - The Express response object to send the response.
+   */
   static async getShow(req, res) {
-    const token = req.header('X-Token');
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
+    const userId = req.user._id; // Get user ID from the authenticated user
+    const { id } = req.params;
 
-    const userId = await redisClient.get(`auth_${token}`);
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
+    // Convert request parameter ID to a valid MongoDB Object ID
+    const _id = ObjectId.isValid(id) ? new ObjectId(id) : id;
 
-    const fileId = req.params.id;
-    const file = await dbClient.dbClient.collection('files').findOne({ _id: ObjectId(fileId), userId: ObjectId(userId) });
+    // Retrieve the file document from the database based on ID and user ID
+    const fileDocument = await FilesCollection.getFile({ _id, userId });
 
-    if (!file) return res.status(404).json({ error: 'Not found' });
-
-    return res.json(file);
-  }
-
-  static async getIndex(req, res) {
-    const token = req.header('X-Token');
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-
-    const userIdString = await redisClient.get(`auth_${token}`);
-
-    if (!userIdString) return res.status(401).json({ error: 'Unauthorized' });
-
-    const parentId = req.query.parentId ? ObjectId(req.query.parentId) : '0';
-    const userId = ObjectId(userIdString);
-    const filesCount = await dbClient.dbClient.collection('files')
-      .countDocuments({ userId, parentId });
-
-    if (filesCount === '0') return res.json([]);
-
-    const skip = (parseInt(req.query.page, 10) || 0) * 20;
-    const files = await dbClient.dbClient.collection('files')
-      .aggregate([
-        { $match: { userId, parentId } },
-        { $skip: skip },
-        { $limit: 20 },
-      ]).toArray();
-
-    const modifyResult = files.map((file) => ({
-      ...file,
-      id: file._id,
-      _id: undefined,
-    }));
-
-    return res.json(modifyResult);
-  }
-
-  static async putPublish(req, res) {
-    const token = req.header('X-Token');
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-
-    const userId = await redisClient.get(`auth_${token}`);
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-    const fileId = req.params.id;
-    const file = await dbClient.dbClient.collection('files').findOne({ _id: ObjectId(fileId), userId: ObjectId(userId) });
-    if (!file) return res.status(404).json({ error: 'Not found' });
-
-    await dbClient.dbClient.collection('files').updateOne({ _id: ObjectId(fileId) }, { $set: { isPublic: true } });
-
-    const updatedFile = await dbClient.dbClient.collection('files').findOne({ _id: ObjectId(fileId) });
-    return res.status(200).json(updatedFile);
-  }
-
-  static async putUnpublish(req, res) {
-    const token = req.header('X-Token');
-    if (!token) return res.status(401).json({ error: 'Unauthorized' });
-
-    const userId = await redisClient.get(`auth_${token}`);
-    if (!userId) return res.status(401).json({ error: 'Unauthorized' });
-
-    const fileId = req.params.id;
-    const file = await dbClient.dbClient.collection('files').findOne({ _id: ObjectId(fileId), userId: ObjectId(userId) });
-    if (!file) return res.status(404).json({ error: 'Not found' });
-
-    await dbClient.dbClient.collection('files').updateOne({ _id: ObjectId(fileId) }, { $set: { isPublic: false } });
-
-    const updatedFile = await dbClient.dbClient.collection('files').findOne({ _id: ObjectId(fileId) });
-    return res.status(200).json(updatedFile);
-  }
-
-  static async getFile(req, res) {
-    const token = req.header('X-Token');
-    const userId = await redisClient.get(`auth_${token}`);
-    const fileId = req.params.id;
-    const { size } = req.query;
-    const file = await dbClient.dbClient.collection('files').findOne({ _id: ObjectId(fileId) });
-    // file private and user not signin
-    // file private and user is sign in but not the owner
-    if (!file || (!file.isPublic && (!userId || userId !== file.userId.toString()))) {
+    // Handle file not found case
+    if (!fileDocument) {
       return res.status(404).json({ error: 'Not found' });
     }
 
-    if (file.type === 'folder') return res.status(400).json({ error: "A folder doesn't have content" });
+    // Format the file document for the response
+    const formattedResponse = formatFileDocument(fileDocument);
 
-    let { localPath } = file;
-    if (size) localPath = `${localPath}_${size}`;
-
-    if (!fs.existsSync(localPath)) return res.status(404).json({ error: 'Not found' });
-
-    res.setHeader('Content-Type', mime.lookup(file.name));
-    return res.sendFile(localPath);
+    // Send a successful response with the formatted file information
+    return res.status(200).json(formattedResponse);
   }
-}
 
-export default FilesController;
+  /**
+   * Controller for retrieving a list of a user's files (GET /files).
+   * Uses aggregation pipeline to efficiently retrieve files with pagination.
+   *
+   * @param {import("express").Request} req - The incoming Express request object.
+   * @param {import("express").Response} res - The Express response object to send the response.
+   */
+  static async getIndex(req, res) {
+    const MAX_PAGE_SIZE = 20; // Maximum number of files per page
+
+    // Access the files collection from the database client
+    const FilesCollection = dbClient.getCollection('files');
+
+    const userId = req.user._id; // Get user ID from the authenticated user
+
+    // Extract query parameters for parent ID and page number
+    const { parentId = '0', page = 0 } = req.query;
+
+    // Convert parent ID to a valid MongoDB Object ID (if provided)
+    const _parentId = parentId && ObjectId.isValid(parentId) ? new ObjectId(parentId) : parentId;
