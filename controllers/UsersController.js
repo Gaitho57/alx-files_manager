@@ -1,45 +1,40 @@
-import Queue from 'bull'; // Job queue library for asynchronous tasks (sending welcome emails)
-import UsersCollection from '../utils/users'; // Utility for interacting with the user collection
+/* eslint-disable import/no-named-as-default */
+import sha1 from 'sha1';
+import Queue from 'bull/lib/queue';
+import dbClient from '../utils/db';
 
-// Dedicated queue for sending welcome emails to new users
-const userQueue = Queue('send welcome email', { /* queue configuration options */ });
+const userQueue = new Queue('email sending');
 
-class UsersController {
-  /**
-   * Controller for creating new users (POST /users).
-   * Handles user registration by creating a new user document in the database
-   * and adding a job to the queue for sending a welcome email.
-   *
-   * @param {import("express").Request} req - The incoming Express request object.
-   * @param {import("express").Response} res - The Express response object to send the response.
-   */
+export default class UsersController {
   static async postNew(req, res) {
-    const { email, password } = req.body; // Extract email and password from request body
+    const email = req.body ? req.body.email : null;
+    const password = req.body ? req.body.password : null;
 
-    // Validate required fields: email and password
-    if (email === undefined) {
+    if (!email) {
       res.status(400).json({ error: 'Missing email' });
       return;
-    } else if (password === undefined) {
+    }
+    if (!password) {
       res.status(400).json({ error: 'Missing password' });
       return;
     }
+    const user = await (await dbClient.usersCollection()).findOne({ email });
 
-    // Check for existing user with the same email address
-    if (await UsersCollection.getUser({ email })) {
-      res.status(400).json({ error: 'Already exists' });
+    if (user) {
+      res.status(400).json({ error: 'Already exist' });
       return;
     }
+    const insertionInfo = await (await dbClient.usersCollection())
+      .insertOne({ email, password: sha1(password) });
+    const userId = insertionInfo.insertedId.toString();
 
-    // Create a new user document in the database
-    const userId = await UsersCollection.createUser(email, password);
+    userQueue.add({ userId });
+    res.status(201).json({ email, id: userId });
+  }
 
-    // Add a job to the queue for sending a welcome email to the newly created user
-    userQueue.add({ userId }); // Asynchronously add the job to the queue
+  static async getMe(req, res) {
+    const { user } = req;
 
-    // Send a successful response with the user ID and email
-    res.status(201).json({ id: userId, email });
+    res.status(200).json({ email: user.email, id: user._id.toString() });
   }
 }
-
-export default UsersController;

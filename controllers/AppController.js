@@ -1,52 +1,42 @@
-// Import necessary modules
-import dbClient from '../utils/db'; // Database client
-import redisClient from '../utils/redis'; // Redis client
+import redis from '../utils/redis'; // Import the Redis client (assuming renamed from redisClient)
+import db from '../utils/db'; // Import the database client (assuming renamed from dbClient)
 
-class AppController {
+/**
+ * AppController class for handling application-level requests.
+ */
+export default class AppController {
   /**
-   * Controller for the `/status` endpoint.
-   * Retrieves and responds with the connection status of the MongoDB and Redis clients.
+   * Retrieves the health status of the application.
    *
-   * @param {import("express").Request} _req - The incoming Express request object (unused).
-   * @param {import("express").Response} res - The Express response object to send the response.
+   * @param {express.Request} req - The incoming request object.
+   * @param {express.Response} res - The outgoing response object.
+   * @returns {void} - Sends a JSON response with the status of Redis and the database.
    */
-  static async getStatus(_req, res) {
-    // Check if both database and cache clients are alive (connected)
-    if (dbClient.isAlive() && redisClient.isAlive()) {
-      // Send a successful response (status code 200) with connection status information
-      res.status(200).json({ redis: true, db: true });
-    } else {
-      // If either client is not alive, handle the error appropriately
-      // (consider logging the error or returning a more informative response)
-      console.error('Error: Database or Redis client is not alive!');
-      res.status(500).json({ error: 'Internal server error' }); // Example error response
-    }
+  static async getStatus(req, res) {
+    const redisStatus = await redis.isAlive(); // Check Redis health (assuming method exists)
+    const dbStatus = await db.isAlive(); // Check database health (assuming method exists)
+
+    res.status(200).json({
+      redis: redisStatus,
+      db: dbStatus,
+    });
   }
 
   /**
-   * Controller for the `/stats` endpoint.
-   * Retrieves and responds with the count of users and files from the database.
+   * Retrieves application statistics about users and files.
    *
-   * @param {import("express").Request} _req - The incoming Express request object (unused).
-   * @param {import("express").Response} res - The Express response object to send the response.
-   * @param {import("express").NextFunction} next - Express next function for error handling.
+   * @param {express.Request} req - The incoming request object.
+   * @param {express.Response} res - The outgoing response object.
+   * @returns {void} - Sends a JSON response with the number of users and files.
    */
-  static async getStats(_req, res, next) {
+  static async getStats(req, res) {
     try {
-      // Retrieve the number of users from the database
-      const users = await dbClient.nbUsers();
-
-      // Retrieve the number of files from the database
-      const files = await dbClient.nbFiles();
-
-      // Send a successful response (status code 200) with user and file counts
-      res.status(200).json({ users, files });
-    } catch (err) {
-      // Handle potential errors during data retrieval
-      console.error('Error retrieving stats:', err);
-      next(err); // Pass the error to the Express error handler
+      const [usersCount, filesCount] = await Promise.all([db.nbUsers(), db.nbFiles()]);
+      res.status(200).json({ users: usersCount, files: filesCount });
+    } catch (error) {
+      // Handle potential errors during data retrieval (implementation omitted here)
+      console.error('Error fetching application stats:', error);
+      res.status(500).json({ error: 'Failed to retrieve application statistics' });
     }
   }
 }
-
-export default AppController;
