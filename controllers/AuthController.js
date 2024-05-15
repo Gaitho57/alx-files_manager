@@ -1,39 +1,44 @@
-import { v4 as uuidv4 } from 'uuid'; // Import UUID generation function
-import redisClient from '../utils/redis'; // Import the Redis client instance
+import sha1 from 'sha1';
+import { v4 as uuidv4 } from 'uuid';
+import dbClient from '../utils/db';
+import redisClient from '../utils/redis';
 
-/**
- * AuthController class for handling authentication-related requests.
- */
-export default class AuthController {
-  /**
-   * Generates and issues an authentication token for a logged-in user.
-   *
-   * @param {express.Request} req - The incoming request object.
-   * @param {express.Response} res - The outgoing response object.
-   * @returns {Promise<void>} - Sends a JSON response with the generated token.
-   */
-  static async getConnect(req, res) {
-    const { user } = req; // Assuming user data is available in the request object
-
-    const token = uuidv4(); // Generate a unique token using UUID v4
-
-    await redisClient.set(`auth_${token}`, user._id.toString(), 24 * 60 * 60); // Store user ID in Redis with prefixed key, set expiry to 24 hours
-
-    res.status(200).json({ token });
+class AuthController {
+  static async getConnect(request, response) {
+    const authData = request.header('Authorization');
+    let userEmail = authData.split(' ')[1];
+    const buff = Buffer.from(userEmail, 'base64');
+    userEmail = buff.toString('ascii');
+    const data = userEmail.split(':'); // contains email and password
+    if (data.length !== 2) {
+      response.status(401).json({ error: 'Unauthorized' });
+      return;
+    }
+    const hashedPassword = sha1(data[1]);
+    const users = dbClient.db.collection('users');
+    users.findOne({ email: data[0], password: hashedPassword }, async (err, user) => {
+      if (user) {
+        const token = uuidv4();
+        const key = `auth_${token}`;
+        await redisClient.set(key, user._id.toString(), 60 * 60 * 24);
+        response.status(200).json({ token });
+      } else {
+        response.status(401).json({ error: 'Unauthorized' });
+      }
+    });
   }
 
-  /**
-   * Deletes an authentication token associated with a request header.
-   *
-   * @param {express.Request} req - The incoming request object.
-   * @param {express.Response} res - The outgoing response object.
-   * @returns {Promise<void>} - Sends an empty response (204 No Content) on successful deletion.
-   */
-  static async getDisconnect(req, res) {
-    const token = req.headers['x-token']; // Retrieve token from the "x-token" header
-
-    await redisClient.del(`auth_${token}`); // Delete token key from Redis
-
-    res.status(204).send(); // Send an empty response to indicate successful deletion
+  static async getDisconnect(request, response) {
+    const token = request.header('X-Token');
+    const key = `auth_${token}`;
+    const id = await redisClient.get(key);
+    if (id) {
+      await redisClient.del(key);
+      response.status(204).json({});
+    } else {
+      response.status(401).json({ error: 'Unauthorized' });
+    }
   }
 }
+
+module.exports = AuthController;
